@@ -75,7 +75,7 @@ from nitrostack.protocol.meta import (
     strip_tool_arguments,
 )
 from nitrostack.protocol.observability import TraceContext, extract_trace_context
-from nitrostack.runtime.correlation import new_correlation_id
+from nitrostack.runtime.correlation import InFlightRegistry, new_correlation_id
 from nitrostack.transports.headers import (
     extract_mcp_param_headers,
     extract_mcp_scope_headers,
@@ -541,6 +541,7 @@ class McpApplication:
         self._prompts: Dict[str, _PromptEntry] = {}
         self._initial_tools: List[Tuple[Any, Callable, ToolConfig]] = []
         self.task_manager = TaskManager()
+        self._in_flight = InFlightRegistry()
 
         self._bootstrap()
 
@@ -764,11 +765,14 @@ class McpApplication:
     # Protocol handler wiring (owned low-level `mcp.server.lowlevel.Server`)
     # ------------------------------------------------------------------
 
-    def _advertise_tasks_extension(self) -> bool:
+    def _tasks_visible_on_wire(self) -> bool:
         # Tasks remain available to in-process callers and the legacy wire only.
         # MCP 2026 has no complete tasks surface (notably tasks/update), so
-        # advertising this partial implementation would make discovery lie.
-        if self.protocol_era in ("auto", "modern"):
+        # nothing on the 2026 wire may advertise this partial implementation.
+        return self.protocol_era not in ("auto", "modern")
+
+    def _advertise_tasks_extension(self) -> bool:
+        if not self._tasks_visible_on_wire():
             return False
         return any(
             entry.config.task_support in ("optional", "required")
@@ -1000,10 +1004,11 @@ class McpApplication:
         cfg = entry.config
         input_schema = self._tool_input_schema(entry.input_model)
 
+        tasks_visible = self._tasks_visible_on_wire()
         meta: Dict[str, Any] = {
             "is_initial": cfg.is_initial,
             "visibility": cfg.visibility,
-            "task_support": cfg.task_support,
+            **({"task_support": cfg.task_support} if tasks_visible else {}),
             **(cfg.metadata or {}),
         }
 
@@ -1045,7 +1050,7 @@ class McpApplication:
         )
 
         execution = None
-        if cfg.task_support and cfg.task_support != "forbidden":
+        if tasks_visible and cfg.task_support and cfg.task_support != "forbidden":
             execution = types.ToolExecution(taskSupport=cfg.task_support)
 
         tool_kwargs: Dict[str, Any] = {
@@ -1378,6 +1383,7 @@ class McpApplication:
             trace=trace,
         )
         _apply_request_envelope(ctx, rc)
+        ticket = self._in_flight.register(correlation_id, jsonrpc_id=jsonrpc_id)
         try:
             result = await run_pipeline(
                 handler=entry.method,
@@ -1397,6 +1403,13 @@ class McpApplication:
             logger.exception("Tool %s failed", cfg.name)
             return types.CallToolResult(
                 content=[types.TextContent(type="text", text=str(exc))],
+                isError=True,
+            )
+        finally:
+            self._in_flight.discard(correlation_id)
+        if ticket.cancel_requested.is_set():
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text="Request was cancelled.")],
                 isError=True,
             )
         return self._to_call_tool_result(result, entry.component, ctx)

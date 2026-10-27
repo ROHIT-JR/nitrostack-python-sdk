@@ -171,3 +171,43 @@ def test_2026_task_augmented_http_call_is_not_a_task_result():
     body = response.json()
     assert body["error"]["code"] == -32602
     assert "resultType" not in body.get("result", {})
+
+
+def _tools_list_http(era: str) -> dict:
+    """Run a real tools/list over the mounted /mcp app and return the tool named ``taskable``."""
+    response = _http_request(
+        _app(era),
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}},
+        extra_headers={"Mcp-Method": "tools/list"} if era == "modern" else None,
+    )
+    assert response.status_code == 200, response.text
+    tools = response.json()["result"]["tools"]
+    return next(t for t in tools if t["name"] == "taskable")
+
+
+@pytest.mark.parametrize("era", ["auto", "modern"])
+def test_2026_tool_definitions_do_not_advertise_task_support(era):
+    """Regression: tools/list used to keep task_support="optional" while tasks were off."""
+    app = _app(era)
+    for entry in app._tools.values():
+        definition = app._build_tool_definition(entry)
+        assert definition.execution is None
+        assert "task_support" not in (definition.meta or {})
+        assert "taskSupport" not in json.dumps(definition.model_dump(by_alias=True, exclude_none=True))
+
+
+@pytest.mark.parametrize("era", ["auto", "modern"])
+def test_2026_tools_list_over_http_does_not_advertise_task_support(era):
+    tool_json = _tools_list_http(era)
+    assert "execution" not in tool_json
+    assert "task_support" not in tool_json.get("_meta", {})
+    assert "taskSupport" not in json.dumps(tool_json)
+
+
+def test_legacy_tool_definitions_still_advertise_task_support():
+    app = _app("legacy")
+    definitions = {e.config.name: app._build_tool_definition(e) for e in app._tools.values()}
+    taskable = definitions["taskable"]
+    assert taskable.execution is not None
+    assert taskable.execution.task_support == "optional"
+    assert (taskable.meta or {}).get("task_support") == "optional"
